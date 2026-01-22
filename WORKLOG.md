@@ -18,3 +18,5 @@
 - Per-queue cond_vec and reduced group_size (cycles 1945); reverted.
 - group_size=24/28 tuning (cycles 1829/1855); reverted.
 - Depth0 flow vselect (forest1/2) instead of multiply_add (cycles 1868); reverted.
+- 2026-01-22: Replaced wrap-round `idx *= 0` valu op with flow vselect using `zero_vec`; cycles improved to 1772.
+- Snapshot saved: `kernel_snapshots/build_kernel_2026-01-22_1401.py`.
