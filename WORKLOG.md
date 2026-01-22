@@ -28,4 +28,17 @@
 - 2026-01-22: Tried scheduling load before valu in scheduler; no improvement vs 1750, reverted.
 - 2026-01-22: Depth1 path: kept cond recompute (due to cond_vec reuse) but replaced `+3` with flow vselect (cond?4:3) using new four_vec; cycles improved to 1733.
 - 2026-01-22: Attempted to remove cond recompute entirely; broke correctness, reverted.
+- 2026-01-22: Tried `group_size = min(chunk_count, 16)`; cycles regressed to 1813, reverted.
 - Snapshot saved: `kernel_snapshots/build_kernel_2026-01-22_1441.py`.
+- 2026-01-22: Dropped idx vload/vstore + idx_ptr consts, packed value vloads (2 per load instr), and set idx on depth0 via flow vselect; cycles improved to 1724.
+- Snapshot saved: `kernel_snapshots/build_kernel_2026-01-22_1515.py`.
+- 2026-01-22: Moved value vloads into per-queue ops and allowed packing multiple load ops per cycle; cycles improved to 1708.
+- Snapshot saved: `kernel_snapshots/build_kernel_2026-01-22_1522.py`.
+- 2026-01-22: Tried `group_size = min(chunk_count, 24)` with in-queue vloads; cycles regressed to 1757, reverted.
+- 2026-01-22: Scheduler tweak `need_addr <= 8` improved cycles to 1701.
+- 2026-01-22: Scheduler tweak `need_addr <= 10` improved cycles to 1695 (best so far).
+- Snapshot saved: `kernel_snapshots/build_kernel_2026-01-22_1529.py`.
+- 2026-01-22: Tried `need_addr <= 11/12`; cycles regressed to 1700/1697, reverted to 10.
+- 2026-01-22: Tried addr_budget 4/3/1 with `need_addr <= 10`; no cycle change vs 1695, reverted.
+- 2026-01-22: Tried `need_addr <= 9`; cycles regressed to 1699, reverted to 10.
+- 2026-01-22: Retried depth0 flow vselect (forest1/2) + removed forest_diff_vec; cycles regressed to 1721, reverted.
