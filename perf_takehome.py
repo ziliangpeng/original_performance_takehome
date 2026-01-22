@@ -34,7 +34,6 @@ from problem import (
     reference_kernel,
     build_mem_image,
     reference_kernel2,
-    Instruction,
 )
 
 
@@ -45,7 +44,6 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
-        self.const_loads = []
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -60,13 +58,6 @@ class KernelBuilder:
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
-    def emit(self, instr: Instruction):
-        """
-        Append a full instruction bundle. Each engine entry should contain
-        a list of slots already respecting SLOT_LIMITS.
-        """
-        self.instrs.append(instr)
-
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
         if name is not None:
@@ -79,24 +70,9 @@ class KernelBuilder:
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.const_loads.append((addr, val))
+            self.add("load", ("const", addr, val))
             self.const_map[val] = addr
         return self.const_map[val]
-
-    def emit_const_loads(self):
-        if not self.const_loads:
-            return
-        const_instrs = []
-        slots = []
-        for addr, val in self.const_loads:
-            slots.append(("const", addr, val))
-            if len(slots) == SLOT_LIMITS["load"]:
-                const_instrs.append({"load": slots})
-                slots = []
-        if slots:
-            const_instrs.append({"load": slots})
-        self.instrs = const_instrs + self.instrs
-        self.const_loads = []
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
