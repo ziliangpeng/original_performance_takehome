@@ -124,6 +124,21 @@ class KernelBuilder:
             batch_size % VLEN == 0
         ), "This optimized kernel expects batch_size to be divisible by VLEN"
 
+        instrs = self.instrs
+
+        def emit(instr):
+            instrs.append(instr)
+
+        const_map = {}
+        const_loads = []
+
+        def const(val, name=None):
+            if val not in const_map:
+                addr = self.alloc_scratch(name)
+                const_map[val] = addr
+                const_loads.append((addr, val))
+            return const_map[val]
+
         chunk_count = batch_size // VLEN
 
         # Scalar constants
@@ -131,14 +146,14 @@ class KernelBuilder:
         inp_indices_p_val = forest_values_p_val + n_nodes
         inp_values_p_val = inp_indices_p_val + batch_size
 
-        zero = self.scratch_const(0, "zero")
-        one = self.scratch_const(1, "one")
-        two = self.scratch_const(2, "two")
-        three = self.scratch_const(3, "three")
-        n_nodes_c = self.scratch_const(n_nodes, "n_nodes")
-        forest_values_p = self.scratch_const(forest_values_p_val, "forest_values_p")
-        inp_indices_p = self.scratch_const(inp_indices_p_val, "inp_indices_p")
-        inp_values_p = self.scratch_const(inp_values_p_val, "inp_values_p")
+        zero = const(0, "zero")
+        one = const(1, "one")
+        two = const(2, "two")
+        three = const(3, "three")
+        n_nodes_c = const(n_nodes, "n_nodes")
+        forest_values_p = const(forest_values_p_val, "forest_values_p")
+        inp_indices_p = const(inp_indices_p_val, "inp_indices_p")
+        inp_values_p = const(inp_values_p_val, "inp_values_p")
 
         # Vector constants
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
@@ -171,7 +186,7 @@ class KernelBuilder:
                     ("vbroadcast", dest, src)
                     for dest, src in pairs[i : i + SLOT_LIMITS["valu"]]
                 ]
-                self.emit({"valu": slots})
+                emit({"valu": slots})
 
         emit_vbcasts(
             [
@@ -183,14 +198,14 @@ class KernelBuilder:
                 (forest_vec, forest_values_p),
             ]
         )
-        forest1_addr = self.scratch_const(forest_values_p_val + 1)
-        forest2_addr = self.scratch_const(forest_values_p_val + 2)
+        forest1_addr = const(forest_values_p_val + 1)
+        forest2_addr = const(forest_values_p_val + 2)
         if use_level2_const:
-            forest3_addr = self.scratch_const(forest_values_p_val + 3)
-            forest4_addr = self.scratch_const(forest_values_p_val + 4)
-            forest5_addr = self.scratch_const(forest_values_p_val + 5)
-            forest6_addr = self.scratch_const(forest_values_p_val + 6)
-        self.emit(
+            forest3_addr = const(forest_values_p_val + 3)
+            forest4_addr = const(forest_values_p_val + 4)
+            forest5_addr = const(forest_values_p_val + 5)
+            forest6_addr = const(forest_values_p_val + 6)
+        emit(
             {
                 "load": [
                     ("load", forest0_scalar, forest_values_p),
@@ -198,9 +213,9 @@ class KernelBuilder:
                 ]
             }
         )
-        self.emit({"load": [("load", forest2_scalar, forest2_addr)]})
+        emit({"load": [("load", forest2_scalar, forest2_addr)]})
         if use_level2_const:
-            self.emit(
+            emit(
                 {
                     "load": [
                         ("load", forest3_scalar, forest3_addr),
@@ -208,7 +223,7 @@ class KernelBuilder:
                     ]
                 }
             )
-            self.emit(
+            emit(
                 {
                     "load": [
                         ("load", forest5_scalar, forest5_addr),
@@ -232,21 +247,21 @@ class KernelBuilder:
                     (forest6_vec, forest6_scalar),
                 ]
             )
-        self.emit({"valu": [("-", forest_diff_vec, forest2_vec, forest1_vec)]})
+        emit({"valu": [("-", forest_diff_vec, forest2_vec, forest1_vec)]})
 
         hash_plan = []
         hash_bcasts = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             hv1 = self.alloc_scratch(f"hash{hi}_a", VLEN)
-            hash_bcasts.append((hv1, self.scratch_const(val1)))
+            hash_bcasts.append((hv1, const(val1)))
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 mul_val = (1 << val3) + 1
                 mul_vec = self.alloc_scratch(f"hash{hi}_mul", VLEN)
-                hash_bcasts.append((mul_vec, self.scratch_const(mul_val)))
+                hash_bcasts.append((mul_vec, const(mul_val)))
                 hash_plan.append(("muladd", hv1, mul_vec))
             else:
                 hv3 = self.alloc_scratch(f"hash{hi}_b", VLEN)
-                hash_bcasts.append((hv3, self.scratch_const(val3)))
+                hash_bcasts.append((hv3, const(val3)))
                 hash_plan.append((op1, hv1, op2, op3, hv3))
         emit_vbcasts(hash_bcasts)
 
@@ -263,8 +278,8 @@ class KernelBuilder:
         val_ptrs = []
         for ci in range(chunk_count):
             offset = ci * VLEN
-            idx_ptrs.append(self.scratch_const(inp_indices_p_val + offset))
-            val_ptrs.append(self.scratch_const(inp_values_p_val + offset))
+            idx_ptrs.append(const(inp_indices_p_val + offset))
+            val_ptrs.append(const(inp_values_p_val + offset))
 
         group_size = chunk_count
         addr_vecs = [self.alloc_scratch(f"addr_vec_{i}", VLEN) for i in range(group_size)]
@@ -273,7 +288,7 @@ class KernelBuilder:
         # Load inputs into scratch buffers once
         for ci in range(chunk_count):
             offset = ci * VLEN
-            self.emit(
+            emit(
                 {
                     "load": [
                         ("vload", idx_buf + offset, idx_ptrs[ci]),
@@ -592,7 +607,7 @@ class KernelBuilder:
                             instr[eng] = op_slots
                             q.pop()
                             break
-                self.instrs.append(instr)
+                emit(instr)
                 start = (start + 1) % len(queues)
 
         for base_chunk in range(0, chunk_count, group_size):
@@ -618,7 +633,17 @@ class KernelBuilder:
                 )
             schedule_wave(queues)
 
-        self.emit_const_loads()
+        if const_loads:
+            const_instrs = []
+            slots = []
+            for addr, val in const_loads:
+                slots.append(("const", addr, val))
+                if len(slots) == SLOT_LIMITS["load"]:
+                    const_instrs.append({"load": slots})
+                    slots = []
+            if slots:
+                const_instrs.append({"load": slots})
+            self.instrs = const_instrs + self.instrs
 
 BASELINE = 147734
 
