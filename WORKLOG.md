@@ -20,3 +20,5 @@
 - Depth0 flow vselect (forest1/2) instead of multiply_add (cycles 1868); reverted.
 - 2026-01-22: Replaced wrap-round `idx *= 0` valu op with flow vselect using `zero_vec`; cycles improved to 1772.
 - Snapshot saved: `kernel_snapshots/build_kernel_2026-01-22_1401.py`.
+- 2026-01-22: Scheduler tweak (higher addr_budget when load_supply low) improved cycles to 1750.
+- Snapshot saved: `kernel_snapshots/build_kernel_2026-01-22_1406.py`.
