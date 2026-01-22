@@ -26,3 +26,6 @@
 - 2026-01-22: Tried need_addr threshold <=8; cycles regressed to 1754, reverted to <=6.
 - 2026-01-22: Tried addr_budget threshold <=5 (instead of <=4); no cycle improvement vs 1750, reverted.
 - 2026-01-22: Tried scheduling load before valu in scheduler; no improvement vs 1750, reverted.
+- 2026-01-22: Depth1 path: kept cond recompute (due to cond_vec reuse) but replaced `+3` with flow vselect (cond?4:3) using new four_vec; cycles improved to 1733.
+- 2026-01-22: Attempted to remove cond recompute entirely; broke correctness, reverted.
+- Snapshot saved: `kernel_snapshots/build_kernel_2026-01-22_1441.py`.
