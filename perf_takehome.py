@@ -102,6 +102,7 @@ class KernelBuilder:
           main memory at the start/end.
         - Vectorize all arithmetic over VLEN lanes.
         - Avoid flow engine entirely by using arithmetic equivalents.
+        - Bundle ops across chunks to overlap load and valu work.
         """
         assert (
             batch_size % VLEN == 0
@@ -138,15 +139,19 @@ class KernelBuilder:
         ]:
             self.emit({"valu": [("vbroadcast", dest, src)]})
 
-        hash1_vec = []
-        hash3_vec = []
+        hash_plan = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             hv1 = self.alloc_scratch(f"hash{hi}_a", VLEN)
-            hv3 = self.alloc_scratch(f"hash{hi}_b", VLEN)
             self.emit({"valu": [("vbroadcast", hv1, self.scratch_const(val1))]})
-            self.emit({"valu": [("vbroadcast", hv3, self.scratch_const(val3))]})
-            hash1_vec.append((op1, hv1))
-            hash3_vec.append((op3, hv3))
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                mul_val = (1 << val3) + 1
+                mul_vec = self.alloc_scratch(f"hash{hi}_mul", VLEN)
+                self.emit({"valu": [("vbroadcast", mul_vec, self.scratch_const(mul_val))]})
+                hash_plan.append(("muladd", hv1, mul_vec))
+            else:
+                hv3 = self.alloc_scratch(f"hash{hi}_b", VLEN)
+                self.emit({"valu": [("vbroadcast", hv3, self.scratch_const(val3))]})
+                hash_plan.append((op1, hv1, op2, op3, hv3))
 
         # Scratch buffers for the working set
         idx_buf = self.alloc_scratch("idx_buf", batch_size)
@@ -160,7 +165,7 @@ class KernelBuilder:
             idx_ptrs.append(self.scratch_const(inp_indices_p_val + offset))
             val_ptrs.append(self.scratch_const(inp_values_p_val + offset))
 
-        group_size = 3
+        group_size = min(chunk_count, SLOT_LIMITS["valu"] * 2 + 4)
         addr_vecs = [self.alloc_scratch(f"addr_vec_{i}", VLEN) for i in range(group_size)]
         node_vecs = [self.alloc_scratch(f"node_vec_{i}", VLEN) for i in range(group_size)]
         tmp1_vecs = [self.alloc_scratch(f"tmp1_vec_{i}", VLEN) for i in range(group_size)]
@@ -179,131 +184,134 @@ class KernelBuilder:
                 }
             )
 
-        for _ in range(rounds):
-            for base_chunk in range(0, chunk_count, group_size):
-                active = min(group_size, chunk_count - base_chunk)
-                idx_chunks = [
-                    idx_buf + (base_chunk + i) * VLEN for i in range(active)
-                ]
-                val_chunks = [
-                    val_buf + (base_chunk + i) * VLEN for i in range(active)
-                ]
-
-                # addr_vec = idx + forest_values_p
-                self.emit(
-                    {
-                        "valu": [
-                            ("+", addr_vecs[i], idx_chunks[i], forest_vec)
-                            for i in range(active)
-                        ]
-                    }
-                )
-
-                # node_vec[i] = mem[addr_vec[i]]
+        def build_ops(idx_chunk, val_chunk, regs):
+            addr_vec, node_vec, tmp1_vec, tmp2_vec, cond_vec = regs
+            ops = []
+            for _ in range(rounds):
+                ops.append(("valu", [("+", addr_vec, idx_chunk, forest_vec)]))
                 for start in range(0, VLEN, 2):
-                    load_slots = []
-                    for gi in range(active):
-                        load_slots.append(
-                            ("load_offset", node_vecs[gi], addr_vecs[gi], start)
+                    ops.append(
+                        (
+                            "load",
+                            [
+                                ("load_offset", node_vec, addr_vec, start),
+                                ("load_offset", node_vec, addr_vec, start + 1),
+                            ],
                         )
-                        load_slots.append(
+                    )
+                ops.append(("valu", [("^", val_chunk, val_chunk, node_vec)]))
+                for stage in hash_plan:
+                    if stage[0] == "muladd":
+                        _, hv1, mul_vec = stage
+                        ops.append(
                             (
-                                "load_offset",
-                                node_vecs[gi],
-                                addr_vecs[gi],
-                                start + 1,
+                                "valu",
+                                [("multiply_add", val_chunk, val_chunk, mul_vec, hv1)],
                             )
                         )
-                        if len(load_slots) == 2:
-                            self.emit({"load": load_slots})
-                            load_slots = []
-                    if load_slots:
-                        self.emit({"load": load_slots})
-
-                # val ^= node_val
-                self.emit(
-                    {
-                        "valu": [
-                            ("^", val_chunks[i], val_chunks[i], node_vecs[i])
-                            for i in range(active)
-                        ]
-                    }
-                )
-
-                # myhash over the vector in place
-                for hi, (op1, hv1) in enumerate(hash1_vec):
-                    op3, hv3 = hash3_vec[hi]
-                    self.emit(
-                        {
-                            "valu": [
-                                (op1, tmp1_vecs[i], val_chunks[i], hv1)
-                                for i in range(active)
-                            ]
-                            + [
-                                (op3, tmp2_vecs[i], val_chunks[i], hv3)
-                                for i in range(active)
-                            ]
-                        }
+                    else:
+                        op1, hv1, op2, op3, hv3 = stage
+                        ops.append(
+                            (
+                                "valu",
+                                [
+                                    (op1, tmp1_vec, val_chunk, hv1),
+                                    (op3, tmp2_vec, val_chunk, hv3),
+                                ],
+                            )
+                        )
+                        ops.append(
+                            (
+                                "valu",
+                                [(op2, val_chunk, tmp1_vec, tmp2_vec)],
+                            )
+                        )
+                ops.append(("valu", [("%", cond_vec, val_chunk, two_vec)]))
+                ops.append(("valu", [("+", cond_vec, cond_vec, one_vec)]))
+                ops.append(
+                    (
+                        "valu",
+                        [
+                            (
+                                "multiply_add",
+                                idx_chunk,
+                                idx_chunk,
+                                two_vec,
+                                cond_vec,
+                            )
+                        ],
                     )
-                    self.emit(
-                        {
-                            "valu": [
-                                (HASH_STAGES[hi][2], val_chunks[i], tmp1_vecs[i], tmp2_vecs[i])
-                                for i in range(active)
-                            ]
-                        }
-                    )
+                )
+                ops.append(("valu", [("<", cond_vec, idx_chunk, n_nodes_vec)]))
+                ops.append(("valu", [("*", idx_chunk, idx_chunk, cond_vec)]))
+            return ops
 
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                self.emit(
-                    {
-                        "valu": [
-                            ("*", addr_vecs[i], idx_chunks[i], two_vec)
-                            for i in range(active)
-                        ]
-                    }
+        class OpQueue:
+            def __init__(self, ops):
+                self.ops = ops
+                self.idx = 0
+
+            def ready(self):
+                return self.idx < len(self.ops)
+
+            def peek(self):
+                return self.ops[self.idx]
+
+            def pop(self):
+                self.idx += 1
+
+        def schedule_wave(queues):
+            start = 0
+            while any(q.ready() for q in queues):
+                instr = {}
+                used = set()
+                for engine in ("valu", "load"):
+                    slots = []
+                    limit = SLOT_LIMITS[engine]
+                    for off in range(len(queues)):
+                        gi = (start + off) % len(queues)
+                        if gi in used:
+                            continue
+                        q = queues[gi]
+                        if not q.ready():
+                            continue
+                        eng, op_slots = q.peek()
+                        if eng != engine:
+                            continue
+                        if len(slots) + len(op_slots) > limit:
+                            continue
+                        slots.extend(op_slots)
+                        q.pop()
+                        used.add(gi)
+                        if len(slots) == limit:
+                            break
+                    if slots:
+                        instr[engine] = slots
+                if not instr:
+                    for q in queues:
+                        if q.ready():
+                            eng, op_slots = q.peek()
+                            instr[eng] = op_slots
+                            q.pop()
+                            break
+                self.instrs.append(instr)
+                start = (start + 1) % len(queues)
+
+        for base_chunk in range(0, chunk_count, group_size):
+            active = min(group_size, chunk_count - base_chunk)
+            idx_chunks = [idx_buf + (base_chunk + i) * VLEN for i in range(active)]
+            val_chunks = [val_buf + (base_chunk + i) * VLEN for i in range(active)]
+            queues = []
+            for gi in range(active):
+                regs = (
+                    addr_vecs[gi],
+                    node_vecs[gi],
+                    tmp1_vecs[gi],
+                    tmp2_vecs[gi],
+                    cond_vecs[gi],
                 )
-                self.emit(
-                    {
-                        "valu": [
-                            ("%", cond_vecs[i], val_chunks[i], two_vec)
-                            for i in range(active)
-                        ]
-                    }
-                )
-                self.emit(
-                    {
-                        "valu": [
-                            ("+", cond_vecs[i], cond_vecs[i], one_vec)
-                            for i in range(active)
-                        ]
-                    }
-                )
-                self.emit(
-                    {
-                        "valu": [
-                            ("+", idx_chunks[i], addr_vecs[i], cond_vecs[i])
-                            for i in range(active)
-                        ]
-                    }
-                )
-                # idx = idx if idx < n_nodes else 0
-                self.emit(
-                    {
-                        "valu": [
-                            ("<", cond_vecs[i], idx_chunks[i], n_nodes_vec)
-                            for i in range(active)
-                        ]
-                    }
-                )
-                self.emit(
-                    {
-                        "valu": [
-                            ("*", idx_chunks[i], idx_chunks[i], cond_vecs[i])
-                            for i in range(active)
-                        ]
-                    }
-                )
+                queues.append(OpQueue(build_ops(idx_chunks[gi], val_chunks[gi], regs)))
+            schedule_wave(queues)
 
         # Write results back to memory
         for ci in range(chunk_count):
