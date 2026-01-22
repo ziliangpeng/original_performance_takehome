@@ -25,3 +25,4 @@
 - 2026-01-22: Tried more aggressive addr_budget (4/3/2); no cycle improvement vs 1750, reverted.
 - 2026-01-22: Tried need_addr threshold <=8; cycles regressed to 1754, reverted to <=6.
 - 2026-01-22: Tried addr_budget threshold <=5 (instead of <=4); no cycle improvement vs 1750, reverted.
+- 2026-01-22: Tried scheduling load before valu in scheduler; no improvement vs 1750, reverted.
