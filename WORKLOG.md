@@ -42,3 +42,5 @@
 - 2026-01-22: Tried addr_budget 4/3/1 with `need_addr <= 10`; no cycle change vs 1695, reverted.
 - 2026-01-22: Tried `need_addr <= 9`; cycles regressed to 1699, reverted to 10.
 - 2026-01-22: Retried depth0 flow vselect (forest1/2) + removed forest_diff_vec; cycles regressed to 1721, reverted.
+- 2026-01-22: Scheduler load selection now prioritizes queues with smaller remaining load blocks (finishes load blocks to desync phases); cycles improved to 1596.
+- Snapshot saved: `kernel_snapshots/build_kernel_2026-01-22_1611.py`.
