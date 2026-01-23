@@ -11,6 +11,8 @@
 - If depth-3 caching helps, evaluate depth-4 caching (forest[15..30]).
 - Use per-queue cond_vec temp to avoid recomputing `% 2` in depth==1 path.
 - Tune scheduler to overlap load/valu more aggressively (keep one load per cycle and fill remaining valu slots from other queues).
+- (attempted) Make load scheduling stickier to finish a queue's load block before switching (phase desync).
+- (attempted) Stagger queue starts by pre-advancing a subset of queues to desync phases.
 - Re-tune group_size after any new temps to keep packing efficient.
 
 ### Attempted (regressed)
@@ -44,3 +46,5 @@
 - 2026-01-22: Retried depth0 flow vselect (forest1/2) + removed forest_diff_vec; cycles regressed to 1721, reverted.
 - 2026-01-22: Scheduler load selection now prioritizes queues with smaller remaining load blocks (finishes load blocks to desync phases); cycles improved to 1596.
 - Snapshot saved: `kernel_snapshots/build_kernel_2026-01-22_1611.py`.
+- 2026-01-22: Added sticky load tie-breaker (prefer last loaded queue); no cycle change vs 1596, reverted.
+- 2026-01-22: Tried staggered warmup (4 queues, 2 cycles); cycles regressed to 1601, reverted.
