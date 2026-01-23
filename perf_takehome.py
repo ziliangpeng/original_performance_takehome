@@ -96,10 +96,6 @@ class KernelBuilder:
         - Avoid flow engine entirely by using arithmetic equivalents.
         - Bundle ops across chunks to overlap load and valu work.
         """
-        assert (
-            batch_size % VLEN == 0
-        ), "This optimized kernel expects batch_size to be divisible by VLEN"
-
         instrs = self.instrs
 
         def emit(instr):
@@ -115,7 +111,10 @@ class KernelBuilder:
                 const_loads.append((addr, val))
             return const_map[val]
 
-        chunk_count = batch_size // VLEN
+        full_chunks = batch_size // VLEN
+        tail = batch_size % VLEN
+        padded_batch = full_chunks * VLEN
+        chunk_count = full_chunks
 
         # Scalar constants
         forest_values_p_val = 7
@@ -247,17 +246,41 @@ class KernelBuilder:
         use_round_wrap = n_nodes == expected_nodes
         wrap_period = forest_height + 1
 
-        # Scratch buffers for the working set
-        idx_buf = self.alloc_scratch("idx_buf", batch_size)
-        val_buf = self.alloc_scratch("val_buf", batch_size)
+        tail_extra_consts = 0
+        if tail:
+            for _, val1, _, _, val3 in HASH_STAGES:
+                if val1 not in const_map:
+                    tail_extra_consts += 1
+                if val3 not in const_map:
+                    tail_extra_consts += 1
+        tail_scratch = 0 if tail == 0 else (7 + tail + tail_extra_consts)
+        scratch_limit = SCRATCH_SIZE - tail_scratch
+        base_scratch = self.scratch_ptr
+        full_fixed = base_scratch + 2 * padded_batch + chunk_count
+        full_remaining = scratch_limit - full_fixed
+        max_group_full = full_remaining // (2 * VLEN) if full_remaining >= 0 else 0
+        use_full_buf = max_group_full >= 1
+
+        if use_full_buf:
+            group_size = min(chunk_count, max_group_full)
+            idx_buf = self.alloc_scratch("idx_buf", padded_batch)
+            val_buf = self.alloc_scratch("val_buf", padded_batch)
+        else:
+            stream_remaining = scratch_limit - (base_scratch + chunk_count)
+            max_group_stream = (
+                stream_remaining // (4 * VLEN) if stream_remaining >= 0 else 0
+            )
+            group_size = min(chunk_count, max_group_stream) if max_group_stream > 0 else 0
+            if chunk_count and group_size < 1:
+                raise AssertionError("Batch size too large for scratch buffers")
+            idx_buf = self.alloc_scratch("idx_buf", group_size * VLEN)
+            val_buf = self.alloc_scratch("val_buf", group_size * VLEN)
 
         # Per-chunk constants for input pointers
         val_ptrs = []
         for ci in range(chunk_count):
             offset = ci * VLEN
             val_ptrs.append(const(inp_values_p_val + offset))
-
-        group_size = chunk_count
         addr_vecs = [self.alloc_scratch(f"addr_vec_{i}", VLEN) for i in range(group_size)]
         node_vecs = [self.alloc_scratch(f"node_vec_{i}", VLEN) for i in range(group_size)]
 
@@ -322,7 +345,19 @@ class KernelBuilder:
                                 "valu",
                             )
                         )
-                ops.append(("valu", [("%", cond_vec, val_chunk, two_vec)], "valu"))
+                if use_level2_const and depth == 1 and rounds > 2:
+                    ops.append(
+                        (
+                            "valu",
+                            [
+                                ("%", cond_vec, val_chunk, two_vec),
+                                ("-", idx_chunk, idx_chunk, one_vec),
+                            ],
+                            "valu",
+                        )
+                    )
+                else:
+                    ops.append(("valu", [("%", cond_vec, val_chunk, two_vec)], "valu"))
                 if depth == 0 and rounds > 1:
                     ops.append(
                         (
@@ -340,7 +375,6 @@ class KernelBuilder:
                         )
                     )
                 if use_level2_const and depth == 1 and rounds > 2:
-                    ops.append(("valu", [("-", idx_chunk, idx_chunk, one_vec)], "valu"))
                     ops.append(
                         (
                             "flow",
@@ -461,6 +495,13 @@ class KernelBuilder:
                         break
                     n += 1
                 return n
+            def load_distance(self):
+                if not self.ready():
+                    return 1 << 30
+                for i in range(self.idx, len(self.ops)):
+                    if self.ops[i][0] == "load":
+                        return i - self.idx
+                return 1 << 30
 
         def schedule_wave(queues):
             start = 0
@@ -500,9 +541,8 @@ class KernelBuilder:
                         q.pop()
                         used.add(gi)
                         addr_used += 1
+                candidates = []
                 for off in range(len(queues)):
-                    if len(slots) == limit:
-                        break
                     gi = (start + off) % len(queues)
                     if gi in used:
                         continue
@@ -512,10 +552,18 @@ class KernelBuilder:
                     eng, op_slots, _ = q.peek()
                     if eng != "valu":
                         continue
+                    candidates.append((q.load_distance(), off, gi, op_slots))
+                for _, _, gi, op_slots in sorted(
+                    candidates, key=lambda item: (item[0], len(item[3]), item[1])
+                ):
+                    if len(slots) == limit:
+                        break
+                    if gi in used:
+                        continue
                     if len(slots) + len(op_slots) > limit:
                         continue
                     slots.extend(op_slots)
-                    q.pop()
+                    queues[gi].pop()
                     used.add(gi)
                 if slots:
                     instr["valu"] = slots
@@ -602,10 +650,12 @@ class KernelBuilder:
                 emit(instr)
                 start = (start + 1) % len(queues)
 
-        for base_chunk in range(0, chunk_count, group_size):
+        group_step = max(1, group_size)
+        for base_chunk in range(0, chunk_count, group_step):
             active = min(group_size, chunk_count - base_chunk)
-            idx_chunks = [idx_buf + (base_chunk + i) * VLEN for i in range(active)]
-            val_chunks = [val_buf + (base_chunk + i) * VLEN for i in range(active)]
+            chunk_base = base_chunk if use_full_buf else 0
+            idx_chunks = [idx_buf + (chunk_base + i) * VLEN for i in range(active)]
+            val_chunks = [val_buf + (chunk_base + i) * VLEN for i in range(active)]
             queues = []
             for gi in range(active):
                 regs = (
@@ -623,6 +673,41 @@ class KernelBuilder:
                     )
                 )
             schedule_wave(queues)
+
+        if tail:
+            tail_val = self.alloc_scratch("tail_val")
+            tail_idx = self.alloc_scratch("tail_idx")
+            tail_tmp1 = self.alloc_scratch("tail_tmp1")
+            tail_tmp2 = self.alloc_scratch("tail_tmp2")
+            tail_cond = self.alloc_scratch("tail_cond")
+            tail_addr = self.alloc_scratch("tail_addr")
+            tail_node = self.alloc_scratch("tail_node")
+            tail_base = padded_batch
+            for ti in range(tail):
+                val_ptr = const(inp_values_p_val + tail_base + ti)
+                emit({"load": [("load", tail_val, val_ptr)]})
+                emit({"alu": [("+", tail_idx, zero, zero)]})
+                for _ in range(rounds):
+                    emit({"alu": [("+", tail_addr, forest_values_p, tail_idx)]})
+                    emit({"load": [("load", tail_node, tail_addr)]})
+                    emit({"alu": [("^", tail_val, tail_val, tail_node)]})
+                    for op1, val1, op2, op3, val3 in HASH_STAGES:
+                        emit(
+                            {
+                                "alu": [
+                                    (op1, tail_tmp1, tail_val, const(val1)),
+                                    (op3, tail_tmp2, tail_val, const(val3)),
+                                ]
+                            }
+                        )
+                        emit({"alu": [(op2, tail_val, tail_tmp1, tail_tmp2)]})
+                    emit({"alu": [("%", tail_cond, tail_val, two)]})
+                    emit({"flow": [("select", tail_cond, tail_cond, two, one)]})
+                    emit({"alu": [("*", tail_idx, tail_idx, two)]})
+                    emit({"alu": [("+", tail_idx, tail_idx, tail_cond)]})
+                    emit({"alu": [("<", tail_cond, tail_idx, n_nodes_c)]})
+                    emit({"alu": [("*", tail_idx, tail_idx, tail_cond)]})
+                emit({"store": [("store", val_ptr, tail_val)]})
 
         if const_loads:
             const_instrs = []
